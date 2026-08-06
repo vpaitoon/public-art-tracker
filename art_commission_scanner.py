@@ -1,5 +1,7 @@
 import os
+import re
 import json
+import time
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone
@@ -8,6 +10,78 @@ from datetime import datetime, timezone
 TARGET_STATES = ["NC", "VA", "SC", "TN", "GA", "NORTH CAROLINA", "VIRGINIA", "SOUTH CAROLINA", "TENNESSEE", "GEORGIA"]
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 SEEN_FILE = "seen_commissions.json"
+
+# Generic nav/share links that sometimes match our keyword filters but aren't real opportunities
+NON_OPPORTUNITY_TITLES = {
+    "twitter", "facebook", "instagram", "linkedin", "share", "email", "print",
+    "tweet", "pinterest", "youtube", "x", "learn more", "public art", "artist calls"
+}
+
+BUDGET_PATTERN = re.compile(r'\$\s?\d{1,3}(?:,\d{3})*(?:\.\d{2})?(?:\s*-\s*\$?\s?\d{1,3}(?:,\d{3})*(?:\.\d{2})?)?')
+
+DATE_PATTERN = re.compile(
+    r'(?:(?:January|February|March|April|May|June|July|August|September|October|November|December|'
+    r'Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}'
+    r'|\d{1,2}/\d{1,2}/\d{2,4}'
+    r'|\d{4}-\d{2}-\d{2})',
+    re.IGNORECASE
+)
+
+BUDGET_KEYWORDS = ["budget", "stipend", "honorarium", "compensation", "commission fee", "award amount", "total budget", "project budget"]
+DEADLINE_KEYWORDS = ["deadline", "due date", "due by", "apply by", "applications due", "submissions due", "postmark", "submission deadline", "must be received"]
+
+
+def fetch_opportunity_details(url):
+    """Fetch an individual opportunity's page and pull out a summary, budget, and due date."""
+    details = {"summary": "No summary available.", "budget": "Not specified", "due_date": "Not specified"}
+    try:
+        res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        if res.status_code != 200:
+            return details
+        soup = BeautifulSoup(res.text, "html.parser")
+
+        meta_desc = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", attrs={"property": "og:description"})
+        summary = meta_desc["content"].strip() if meta_desc and meta_desc.get("content") else ""
+        if not summary:
+            for p in soup.find_all("p"):
+                text = p.get_text(strip=True)
+                lower = text.lower()
+                if (len(text) > 120
+                        and "thank you for printing this page" not in lower
+                        and "non-discrimination policy" not in lower
+                        and not lower.startswith("updated:")):
+                    summary = text
+                    break
+        if summary:
+            details["summary"] = (summary[:280] + "…") if len(summary) > 280 else summary
+
+        page_text = soup.get_text(" ", strip=True)
+        lower_text = page_text.lower()
+
+        for keyword in BUDGET_KEYWORDS:
+            idx = lower_text.find(keyword)
+            if idx != -1:
+                window = page_text[max(0, idx - 60):idx + 150]
+                match = BUDGET_PATTERN.search(window)
+                if match:
+                    details["budget"] = match.group(0)
+                    break
+        if details["budget"] == "Not specified":
+            match = BUDGET_PATTERN.search(page_text)
+            if match:
+                details["budget"] = match.group(0)
+
+        for keyword in DEADLINE_KEYWORDS:
+            idx = lower_text.find(keyword)
+            if idx != -1:
+                window = page_text[max(0, idx - 60):idx + 100]
+                match = DATE_PATTERN.search(window)
+                if match:
+                    details["due_date"] = match.group(0)
+                    break
+    except Exception as e:
+        print(f"Error fetching details for {url}: {e}")
+    return details
 
 def load_seen():
     if os.path.exists(SEEN_FILE):
@@ -32,9 +106,11 @@ def fetch_raleigh_arts():
             for a in soup.find_all("a", href=True):
                 title = a.get_text(strip=True)
                 href = a["href"]
+                if not (href.startswith("/") or "raleighnc.gov" in href.lower()):
+                    continue
                 if any(k in href.lower() for k in ["artist-call", "public-art", "seek-raleigh"]):
                     full_url = href if href.startswith("http") else f"https://raleighnc.gov{href}"
-                    if len(title) > 5 and title not in ["Public Art", "Artist Calls", "Learn More"]:
+                    if len(title) > 5 and title.lower() not in NON_OPPORTUNITY_TITLES:
                         opportunities.append({
                             "id": full_url,
                             "title": title,
@@ -59,9 +135,11 @@ def fetch_durham_arts():
             for a in soup.find_all("a", href=True):
                 title = a.get_text(strip=True)
                 href = a["href"]
+                if not (href.startswith("/") or "durhamnc.gov" in href.lower()):
+                    continue
                 if "call" in href.lower() or "rfq" in href.lower() or "public-art" in href.lower():
                     full_url = href if href.startswith("http") else f"https://www.durhamnc.gov{href}"
-                    if len(title) > 8 and "durham" in title.lower():
+                    if len(title) > 8 and "durham" in title.lower() and title.lower() not in NON_OPPORTUNITY_TITLES:
                         opportunities.append({
                             "id": full_url,
                             "title": title,
@@ -86,6 +164,8 @@ def fetch_triangle_artworks():
             for a in soup.find_all("a", href=True):
                 title = a.get_text(strip=True)
                 href = a["href"]
+                if title.lower() in NON_OPPORTUNITY_TITLES:
+                    continue
                 if len(title) > 10 and any(kw in title.lower() for kw in ["public art", "mural", "rfq", "commission", "call"]):
                     full_url = href if href.startswith("http") else f"https://www.triangleartworks.org{href}"
                     opportunities.append({
@@ -112,6 +192,8 @@ def fetch_nc_arts_council():
             for a in soup.find_all("a", href=True):
                 title = a.get_text(strip=True)
                 href = a["href"]
+                if title.lower() in NON_OPPORTUNITY_TITLES:
+                    continue
                 if any(kw in title.lower() for kw in ["public art", "commission", "sculpture", "mural", "rfq"]):
                     full_url = href if href.startswith("http") else f"https://www.ncarts.org{href}"
                     opportunities.append({
@@ -135,14 +217,19 @@ def send_discord_webhook(new_items):
 
     embeds = []
     for item in new_items[:10]:
+        details = fetch_opportunity_details(item["url"])
+        time.sleep(1)  # be polite to the source sites between detail-page fetches
+
         embed = {
             "title": item["title"][:256],
             "url": item["url"],
+            "description": details["summary"][:2048],
             "color": 0x3498DB if item["state"] == "NC" else 0x9B59B6,
             "fields": [
                 {"name": "🏛️ Organization", "value": item["organization"], "inline": True},
                 {"name": "📍 Location", "value": f"{item['location']} ({item['state']})", "inline": True},
-                {"name": "💰 Budget / Notes", "value": item["budget"], "inline": False}
+                {"name": "💰 Budget", "value": details["budget"], "inline": True},
+                {"name": "📅 Due Date", "value": details["due_date"], "inline": True}
             ],
             "footer": {"text": f"Category: {item['category']} | Scanned for Jen"},
             "timestamp": datetime.now(timezone.utc).isoformat()
