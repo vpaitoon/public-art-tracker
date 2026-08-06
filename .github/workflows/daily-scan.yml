@@ -1,0 +1,42 @@
+name: Daily Public Art Commission Scan
+
+on:
+  schedule:
+    # 13:00 UTC = 9:00 AM Eastern (8:00 AM EDT during daylight saving)
+    - cron: "0 13 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scanner
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python art_commission_scanner.py
+
+      - name: Persist seen commissions
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [ -n "$(git status --porcelain seen_commissions.json)" ]; then
+            git add seen_commissions.json
+            git commit -m "Update seen commissions [skip ci]"
+            git push
+          else
+            echo "No changes to seen_commissions.json"
+          fi
