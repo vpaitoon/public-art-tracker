@@ -137,8 +137,12 @@ def fetch_durham_arts():
                 href = a["href"]
                 if not (href.startswith("/") or "durhamnc.gov" in href.lower()):
                     continue
-                if "call" in href.lower() or "rfq" in href.lower() or "public-art" in href.lower():
+                if "customer survey" in title.lower() or "one call" in title.lower():
+                    continue
+                if "rfq" in href.lower() or "public-art" in href.lower() or "call-for" in href.lower() or "calls-for" in href.lower():
                     full_url = href if href.startswith("http") else f"https://www.durhamnc.gov{href}"
+                    if full_url.rstrip("/") == url.rstrip("/"):
+                        continue
                     if len(title) > 8 and "durham" in title.lower() and title.lower() not in NON_OPPORTUNITY_TITLES:
                         opportunities.append({
                             "id": full_url,
@@ -166,8 +170,10 @@ def fetch_triangle_artworks():
                 href = a["href"]
                 if title.lower() in NON_OPPORTUNITY_TITLES:
                     continue
-                if len(title) > 10 and any(kw in title.lower() for kw in ["public art", "mural", "rfq", "commission", "call"]):
+                if len(title) > 10 and any(kw in title.lower() for kw in ["public art", "mural", "rfq", "commission", "call for", "calls for"]):
                     full_url = href if href.startswith("http") else f"https://www.triangleartworks.org{href}"
+                    if full_url.rstrip("/") == url.rstrip("/"):
+                        continue
                     opportunities.append({
                         "id": full_url,
                         "title": title,
@@ -196,6 +202,8 @@ def fetch_nc_arts_council():
                     continue
                 if any(kw in title.lower() for kw in ["public art", "commission", "sculpture", "mural", "rfq"]):
                     full_url = href if href.startswith("http") else f"https://www.ncarts.org{href}"
+                    if full_url.rstrip("/") == url.rstrip("/"):
+                        continue
                     opportunities.append({
                         "id": full_url,
                         "title": title,
@@ -210,47 +218,59 @@ def fetch_nc_arts_council():
         print(f"Error fetching NC Arts Council: {e}")
     return opportunities
 
+DISCORD_EMBEDS_PER_MESSAGE = 10
+
+def build_embed(item):
+    details = fetch_opportunity_details(item["url"])
+    time.sleep(1)  # be polite to the source sites between detail-page fetches
+    return {
+        "title": item["title"][:256],
+        "url": item["url"],
+        "description": details["summary"][:2048],
+        "color": 0x3498DB if item["state"] == "NC" else 0x9B59B6,
+        "fields": [
+            {"name": "🏛️ Organization", "value": item["organization"], "inline": True},
+            {"name": "📍 Location", "value": f"{item['location']} ({item['state']})", "inline": True},
+            {"name": "💰 Budget", "value": details["budget"], "inline": True},
+            {"name": "📅 Due Date", "value": details["due_date"], "inline": True}
+        ],
+        "footer": {"text": f"Category: {item['category']} | Scanned for Jen"},
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
 def send_discord_webhook(new_items):
     if not DISCORD_WEBHOOK_URL:
         print("No DISCORD_WEBHOOK_URL environment variable set. Skipping Discord post.")
         return
 
-    embeds = []
-    for item in new_items[:10]:
-        details = fetch_opportunity_details(item["url"])
-        time.sleep(1)  # be polite to the source sites between detail-page fetches
+    chunks = [new_items[i:i + DISCORD_EMBEDS_PER_MESSAGE] for i in range(0, len(new_items), DISCORD_EMBEDS_PER_MESSAGE)]
 
-        embed = {
-            "title": item["title"][:256],
-            "url": item["url"],
-            "description": details["summary"][:2048],
-            "color": 0x3498DB if item["state"] == "NC" else 0x9B59B6,
-            "fields": [
-                {"name": "🏛️ Organization", "value": item["organization"], "inline": True},
-                {"name": "📍 Location", "value": f"{item['location']} ({item['state']})", "inline": True},
-                {"name": "💰 Budget", "value": details["budget"], "inline": True},
-                {"name": "📅 Due Date", "value": details["due_date"], "inline": True}
-            ],
-            "footer": {"text": f"Category: {item['category']} | Scanned for Jen"},
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }
-        embeds.append(embed)
+    for chunk_index, chunk in enumerate(chunks):
+        embeds = [build_embed(item) for item in chunk]
 
-    payload = {
-        "username": "Public Art Commission Tracker",
-        "avatar_url": "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a2/Arts_icon.svg/512px-Arts_icon.svg.png",
-        "content": f"🎨 **Daily Public Art Commission Update for Jen**\nFound **{len(new_items)}** new opportunity/opportunities in NC and neighboring states!",
-        "embeds": embeds
-    }
-
-    try:
-        res = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
-        if res.status_code in [200, 204]:
-            print("Successfully posted daily update to Discord!")
+        if len(chunks) > 1:
+            header = f"🎨 **Daily Public Art Commission Update for Jen** (part {chunk_index + 1}/{len(chunks)})\nFound **{len(new_items)}** new opportunity/opportunities in NC and neighboring states!"
         else:
-            print(f"Discord Webhook status {res.status_code}: {res.text}")
-    except Exception as e:
-        print(f"Error sending Discord Webhook: {e}")
+            header = f"🎨 **Daily Public Art Commission Update for Jen**\nFound **{len(new_items)}** new opportunity/opportunities in NC and neighboring states!"
+
+        payload = {
+            "username": "Public Art Commission Tracker",
+            "avatar_url": "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a2/Arts_icon.svg/512px-Arts_icon.svg.png",
+            "content": header,
+            "embeds": embeds
+        }
+
+        try:
+            res = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
+            if res.status_code in [200, 204]:
+                print(f"Successfully posted Discord message {chunk_index + 1}/{len(chunks)}!")
+            else:
+                print(f"Discord Webhook status {res.status_code}: {res.text}")
+        except Exception as e:
+            print(f"Error sending Discord Webhook: {e}")
+
+        if chunk_index < len(chunks) - 1:
+            time.sleep(2)  # avoid Discord webhook rate limits between messages
 
 def main():
     print(f"[{datetime.now().isoformat()}] Starting Public Art Commission Scan...")
