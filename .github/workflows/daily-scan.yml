@@ -30,6 +30,7 @@ jobs:
       - name: Run scanner
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          POST_HEARTBEAT: "1"
         run: python art_commission_scanner.py
 
       - name: Persist seen commissions
