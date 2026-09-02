@@ -37,15 +37,65 @@ DEADLINE_KEYWORDS = ["deadline", "due date", "due by", "apply by", "applications
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; PublicArtTracker/1.0; +https://github.com/vpaitoon/public-art-tracker)"}
 
+# raleighnc.gov started returning a Cloudflare "Just a moment..." JS challenge (HTTP 403)
+# to plain requests.get() as of ~2026-08-27, site-wide (listing pages and individual
+# opportunity pages alike). Route those fetches through a real headless browser instead.
+PLAYWRIGHT_DOMAINS = ["raleighnc.gov"]
+
+
+def fetch_rendered_html(url, timeout_ms=20000, max_challenge_wait_s=15):
+    """Load a page with headless Chromium so a Cloudflare JS challenge has a chance to
+    clear before we read the HTML. Spins up a fresh browser per call for simplicity;
+    fine at this scanner's low daily volume."""
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            context = browser.new_context(
+                user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+                viewport={"width": 1280, "height": 800},
+            )
+            page = context.new_page()
+            page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
+            waited = 0
+            while "just a moment" in page.title().strip().lower() and waited < max_challenge_wait_s:
+                page.wait_for_timeout(1000)
+                waited += 1
+            html = page.content()
+        finally:
+            browser.close()
+    return html
+
+
+def fetch_html(url, timeout=15):
+    """Fetch a URL's HTML, transparently falling back to a headless browser for domains
+    known to block plain HTTP clients (see PLAYWRIGHT_DOMAINS). Returns None on failure."""
+    if any(d in url.lower() for d in PLAYWRIGHT_DOMAINS):
+        try:
+            return fetch_rendered_html(url, timeout_ms=timeout * 1000)
+        except Exception as e:
+            print(f"Headless-browser fetch failed for {url}: {e}")
+            return None
+    try:
+        res = requests.get(url, headers=HEADERS, timeout=timeout)
+        if res.status_code == 200:
+            return res.text
+        print(f"Non-200 status {res.status_code} for {url}")
+    except Exception as e:
+        print(f"Error fetching {url}: {e}")
+    return None
+
 
 def fetch_opportunity_details(url):
     """Fetch an individual opportunity's page and pull out a summary, budget, and due date."""
     details = {"summary": "No summary available.", "budget": "Not specified", "due_date": "Not specified"}
     try:
-        res = requests.get(url, headers=HEADERS, timeout=15)
-        if res.status_code != 200:
+        html = fetch_html(url)
+        if not html:
             return details
-        soup = BeautifulSoup(res.text, "html.parser")
+        soup = BeautifulSoup(html, "html.parser")
 
         meta_desc = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", attrs={"property": "og:description"})
         summary = meta_desc["content"].strip() if meta_desc and meta_desc.get("content") else ""
@@ -161,9 +211,9 @@ def fetch_raleigh_arts():
             }
 
     try:
-        res = requests.get(url, headers=HEADERS, timeout=15)
-        if res.status_code == 200:
-            soup = BeautifulSoup(res.text, "html.parser")
+        html = fetch_html(url)
+        if html:
+            soup = BeautifulSoup(html, "html.parser")
 
             # 1) Section-based: each opportunity h2 followed by a "Learn more" link.
             for h2 in soup.find_all(["h2", "h3"]):
@@ -247,9 +297,9 @@ def fetch_durham_arts():
             }
 
     try:
-        res = requests.get(url, headers=HEADERS, timeout=15)
-        if res.status_code == 200:
-            soup = BeautifulSoup(res.text, "html.parser")
+        html = fetch_html(url)
+        if html:
+            soup = BeautifulSoup(html, "html.parser")
 
             # 1) Heading-driven: opportunity heading + nearest application link.
             for h in soup.find_all(["h1", "h2", "h3"]):
@@ -299,9 +349,9 @@ def fetch_triangle_artworks():
     KEYWORDS = ["public art", "mural", "rfq", "commission", "call for", "calls for",
                 "request for qualifications", "artist call", "exhibition", "registry"]
     try:
-        res = requests.get(url, headers=HEADERS, timeout=15)
-        if res.status_code == 200:
-            soup = BeautifulSoup(res.text, "html.parser")
+        html = fetch_html(url)
+        if html:
+            soup = BeautifulSoup(html, "html.parser")
             for a in soup.find_all("a", href=True):
                 title = _clean_title(a.get_text())
                 href = a["href"]
@@ -402,10 +452,10 @@ def fetch_nc_arts_council():
     try:
         for page in range(NC_ARTS_PAGES):
             page_url = base if page == 0 else f"{base}?page={page}"
-            res = requests.get(page_url, headers=HEADERS, timeout=15)
-            if res.status_code != 200:
+            html = fetch_html(page_url)
+            if not html:
                 break
-            soup = BeautifulSoup(res.text, "html.parser")
+            soup = BeautifulSoup(html, "html.parser")
             rows = _parse_nc_arts_table(soup)
             if not rows and page > 0:
                 break
